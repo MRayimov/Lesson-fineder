@@ -1,10 +1,22 @@
+// bot.js
 require('dotenv').config();
+const https = require('https');
 const { Telegraf, Markup } = require('telegraf');
 const Database = require('better-sqlite3');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// ---------- HTTP keep-alive agent to reduce ETIMEDOUT ----------
+const agent = new https.Agent({
+	keepAlive: true,
+	keepAliveMsecs: 10000,
+	timeout: 30000,
+});
 
-// ---- SQLite ----
+// ---------- Bot ----------
+const bot = new Telegraf(process.env.BOT_TOKEN, {
+	telegram: { agent },
+});
+
+// ---------- SQLite ----------
 const db = new Database('videos.db');
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -19,14 +31,13 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS user_memberships (
-    user_id   TEXT NOT NULL,
-    chat_id   TEXT NOT NULL,
-    last_seen INTEGER NOT NULL,
+    user_id    TEXT NOT NULL,
+    chat_id    TEXT NOT NULL,
+    last_seen  INTEGER NOT NULL,
     chat_title TEXT,
     UNIQUE(user_id, chat_id)
   );
 
-  -- Indekslar (tezlik uchun)
   CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_chat_title
     ON videos(chat_id, title);
   CREATE INDEX IF NOT EXISTS idx_videos_chat_created
@@ -52,7 +63,6 @@ const exactVideo = db.prepare(`
   LIMIT 1
 `);
 
-/* LIKE o‘rniga INSTR+LOWER bilan barqaror qidiruv */
 const likeVideos = db.prepare(`
   SELECT chat_id, title, message_id, chat_title FROM videos
   WHERE chat_id = ? AND INSTR(LOWER(title), LOWER(?)) > 0
@@ -60,7 +70,6 @@ const likeVideos = db.prepare(`
   LIMIT 5
 `);
 
-/* Menyu ro‘yxatlari uchun */
 const listChatVideos = db.prepare(`
   SELECT chat_id, title, message_id, chat_title, created_at
   FROM videos
@@ -68,9 +77,10 @@ const listChatVideos = db.prepare(`
   ORDER BY created_at DESC
   LIMIT ? OFFSET ?
 `);
-const countChatVideos = db.prepare(`
-  SELECT COUNT(*) AS c FROM videos WHERE chat_id = ?
-`);
+const countChatVideos = db.prepare(
+	`SELECT COUNT(*) AS c FROM videos WHERE chat_id = ?`
+);
+
 const listUserVideos = db.prepare(`
   SELECT v.chat_id, v.title, v.message_id, v.chat_title, v.created_at
   FROM videos v
@@ -100,27 +110,102 @@ const findUserChats = db.prepare(`
   ORDER BY last_seen DESC
 `);
 
-// Helpers
+// ---------- Helpers ----------
 const isGroup = chat =>
 	chat && (chat.type === 'group' || chat.type === 'supergroup');
 const normalizeTitle = s => (s || '').trim().replace(/\s+/g, ' ');
 const trunc = (s, n = 50) => (s.length <= n ? s : s.slice(0, n - 1) + '…');
 
-/* /start va /help komandalarini ro‘yxatdan o‘tkazamiz */
+// ---------- Rate limit & retry helpers ----------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Global throttle (~25 msgs/sec)
+let lastGlobal = 0;
+async function globalThrottle() {
+	const now = Date.now();
+	const delta = now - lastGlobal;
+	const minGap = 40; // ms
+	if (delta < minGap) await sleep(minGap - delta);
+	lastGlobal = Date.now();
+}
+
+// Per-chat queue (≈ 1 msg/sec per chat)
+const chatLocks = new Map();
+function queueForChat(chatId, task) {
+	const key = String(chatId);
+	const prev = chatLocks.get(key) || Promise.resolve();
+	const next = prev
+		.catch(() => {}) // keep chain alive
+		.then(async () => {
+			await sleep(1100);
+			return task();
+		});
+	chatLocks.set(key, next);
+	return next;
+}
+
+// Unified Telegram call with retry_after support
+async function tgCall(fn) {
+	try {
+		await globalThrottle();
+		return await fn();
+	} catch (e) {
+		const retry =
+			e?.on?.parameters?.retry_after ??
+			e?.parameters?.retry_after ??
+			e?.response?.parameters?.retry_after;
+		const is429 =
+			e?.code === 429 ||
+			e?.statusCode === 429 ||
+			e?.description?.includes?.('Too Many Requests');
+		if (is429 && retry) {
+			await sleep((Number(retry) + 1) * 1000);
+			await globalThrottle();
+			return await fn();
+		}
+		throw e;
+	}
+}
+
+// Safe wrappers (always use these for send/edit/forward)
+async function safeReply(ctx, text, extra) {
+	const targetId = String(ctx.chat?.id || ctx.from?.id);
+	return queueForChat(targetId, () => tgCall(() => ctx.reply(text, extra)));
+}
+async function safeAnswerCb(ctx, text, extra) {
+	const targetId = String(ctx.chat?.id || ctx.from?.id);
+	return queueForChat(targetId, () =>
+		tgCall(() => ctx.answerCbQuery(text, extra))
+	);
+}
+async function safeForward(telegram, toId, fromChatId, messageId) {
+	const targetId = String(toId);
+	return queueForChat(targetId, () =>
+		tgCall(() =>
+			telegram.forwardMessage(targetId, fromChatId, Number(messageId))
+		)
+	);
+}
+async function safeEditReplyMarkup(ctx, markup) {
+	const targetId = String(ctx.chat?.id || ctx.from?.id);
+	return queueForChat(targetId, () =>
+		tgCall(() => ctx.editMessageReplyMarkup(markup))
+	);
+}
+
+// ---------- Commands ----------
 bot.telegram.setMyCommands([
 	{ command: 'help', description: 'Yordam' },
 	{ command: 'find', description: 'Dars qidirish: /find <nom>' },
 	{ command: 'darslar', description: '📚 Darslar menyusi' },
 ]);
 
-// ---- 0) Guruhdagi har qanday xabarda a’zolikni kuzatamiz ----
+// 0) Track memberships on any message in groups
 bot.on('message', (ctx, next) => {
 	try {
 		const m = ctx.message;
-		const chat = m.chat;
-		const inGroup =
-			chat && (chat.type === 'group' || chat.type === 'supergroup');
-		if (inGroup && !m.from.is_bot) {
+		const chat = m?.chat;
+		if (isGroup(chat) && !m.from?.is_bot) {
 			upsertMembership.run({
 				user_id: String(m.from.id),
 				chat_id: String(chat.id),
@@ -131,10 +216,10 @@ bot.on('message', (ctx, next) => {
 	} catch (e) {
 		console.error('membership upsert error', e);
 	}
-	return next(); // /find, menyu va boshqalarga yo‘l beramiz
+	return next();
 });
 
-// ---- 1) Video/Document kelganda indekslash ----
+// 1) Index videos/documents with captions or file_name
 bot.on(['video', 'document'], ctx => {
 	try {
 		const msg = ctx.message;
@@ -164,7 +249,7 @@ bot.on(['video', 'document'], ctx => {
 	}
 });
 
-// ---- 1a) Caption tahrir bo‘lsa qayta indekslash ----
+// 1a) Re-index on caption edits for video-like messages
 bot.on('edited_message', ctx => {
 	try {
 		const msg = ctx.update.edited_message;
@@ -192,7 +277,7 @@ bot.on('edited_message', ctx => {
 	}
 });
 
-// ---- 2) /find komanda ----
+// 2) /find
 bot.command('find', async ctx => {
 	const msg = ctx.message;
 	const chat = msg.chat;
@@ -204,7 +289,7 @@ bot.command('find', async ctx => {
 	);
 
 	if (!q) {
-		return ctx.reply('Qidiruv: /find <video nomi> yoki /find "aniq nom"');
+		return safeReply(ctx, 'Qidiruv: /find <video nomi> yoki /find "aniq nom"');
 	}
 
 	try {
@@ -213,60 +298,74 @@ bot.command('find', async ctx => {
 
 			const ex = exactVideo.get(chatId, q.toLowerCase());
 			if (ex) {
-				return ctx.telegram
-					.forwardMessage(chatId, chatId, ex.message_id)
-					.catch(() =>
-						ctx.reply(
+				return safeForward(ctx.telegram, chatId, chatId, ex.message_id).catch(
+					() =>
+						safeReply(
+							ctx,
 							'Xabar topildi, lekin forward qilib bo‘lmadi (o‘chirilgan bo‘lishi mumkin).'
 						)
-					);
+				);
 			}
 
 			const like = likeVideos.all(chatId, q);
 			if (like.length === 1) {
-				return ctx.telegram
-					.forwardMessage(chatId, chatId, like[0].message_id)
-					.catch(() =>
-						ctx.reply('Xabar topildi, lekin forward qilib bo‘lmadi.')
-					);
+				return safeForward(
+					ctx.telegram,
+					chatId,
+					chatId,
+					like[0].message_id
+				).catch(() =>
+					safeReply(ctx, 'Xabar topildi, lekin forward qilib bo‘lmadi.')
+				);
 			}
 			if (like.length > 1) {
 				const list = like.map(r => `• ${r.title}`).join('\n');
-				return ctx.reply(`Yaqin variantlar:\n${list}\n\nAniqroq nom kiriting.`);
+				return safeReply(
+					ctx,
+					`Yaqin variantlar:\n${list}\n\nAniqroq nom kiriting.`
+				);
 			}
 
-			return ctx.reply('Topilmadi. Nomi aniqroq yoki to‘liq yozib ko‘ring.');
+			return safeReply(
+				ctx,
+				'Topilmadi. Nomi aniqroq yoki to‘liq yozib ko‘ring.'
+			);
 		} else {
-			// Private: foydalanuvchi bor guruhlar bo‘yicha qidirish
+			// Private: search across user memberships
 			const userId = String(msg.from.id);
 			const chats = findUserChats.all(userId);
 			if (!chats.length) {
-				return ctx.reply(
+				return safeReply(
+					ctx,
 					'Siz bilan umumiy guruhlarda indekslangan darslar topilmadi. Avval guruhda /find yoki 📚 Darslar menyusini sinab ko‘ring.'
 				);
 			}
 
-			// 1) aniq moslik
+			// exact matches across chats
 			const exactHits = [];
 			for (const c of chats) {
 				const row = exactVideo.get(c.chat_id, q.toLowerCase());
 				if (row) exactHits.push(row);
 			}
 			if (exactHits.length === 1) {
-				return ctx.telegram
-					.forwardMessage(userId, exactHits[0].chat_id, exactHits[0].message_id)
-					.catch(() => ctx.reply('Topildi, lekin forward qilib bo‘lmadi.'));
+				return safeForward(
+					ctx.telegram,
+					userId,
+					exactHits[0].chat_id,
+					exactHits[0].message_id
+				).catch(() => safeReply(ctx, 'Topildi, lekin forward qilib bo‘lmadi.'));
 			}
 			if (exactHits.length > 1) {
 				const list = exactHits
 					.map((h, i) => `${i + 1}) ${h.chat_title || h.chat_id}`)
 					.join('\n');
-				return ctx.reply(
+				return safeReply(
+					ctx,
 					`Bu nom bir nechta guruhda topildi:\n${list}\nAniqroq yozing (guruh nomi yoki qo‘shimcha so‘zlar).`
 				);
 			}
 
-			// 2) LIKE
+			// fuzzy hits across chats
 			const likeHits = [];
 			for (const c of chats) {
 				const rows = likeVideos.all(c.chat_id, q);
@@ -274,42 +373,48 @@ bot.command('find', async ctx => {
 				if (likeHits.length >= 6) break;
 			}
 			if (likeHits.length === 1) {
-				return ctx.telegram
-					.forwardMessage(userId, likeHits[0].chat_id, likeHits[0].message_id)
-					.catch(() => ctx.reply('Topildi, lekin forward qilib bo‘lmadi.'));
+				return safeForward(
+					ctx.telegram,
+					userId,
+					likeHits[0].chat_id,
+					likeHits[0].message_id
+				).catch(() => safeReply(ctx, 'Topildi, lekin forward qilib bo‘lmadi.'));
 			}
 			if (likeHits.length > 1) {
 				const grouped = likeHits
 					.slice(0, 10)
 					.map(h => `• [${h.chat_title || h.chat_id}] ${h.title}`)
 					.join('\n');
-				return ctx.reply(
+				return safeReply(
+					ctx,
 					`Aniq moslik topilmadi, lekin yaqin variantlar bor:\n${grouped}\n\nAniqroq nom kiriting.`
 				);
 			}
 
-			return ctx.reply('Hech narsa topilmadi. Nomi aniqroq yozib ko‘ring.');
+			return safeReply(
+				ctx,
+				'Hech narsa topilmadi. Nomi aniqroq yozib ko‘ring.'
+			);
 		}
 	} catch (e) {
 		console.error('find error', e);
 	}
 });
 
-// ---- 3) 📚 Darslar menyusi ----
-// /darslar komanda va “📚 Darslar” tugmasi orqali ishga tushadi
+// 3) 📚 Darslar menyusi
 bot.command('darslar', async ctx => showLessonsMenu(ctx));
 bot.hears('📚 Darslar', async ctx => showLessonsMenu(ctx));
 
 async function showLessonsMenu(ctx, offset = 0) {
 	const chat = ctx.chat;
-	const limit = 10;
+	const limit = 8; // slightly smaller page to reduce spam
 
 	if (isGroup(chat)) {
-		// Guruhdagi darslar
 		const chatId = String(chat.id);
 		const total = countChatVideos.get(chatId).c;
 		if (total === 0) {
-			return ctx.reply(
+			return safeReply(
+				ctx,
 				'Bu guruhda indekslangan darslar topilmadi. Video tashlab, caption ga nom yozing.'
 			);
 		}
@@ -322,25 +427,27 @@ async function showLessonsMenu(ctx, offset = 0) {
 			),
 		]);
 
-		// sahifalash
 		const nav = [];
-		if (offset > 0)
+		if (offset > 0) {
 			nav.push(
 				Markup.button.callback(
 					'⬅️ Oldingi',
 					`P|chat|${chatId}|${Math.max(0, offset - limit)}`
 				)
 			);
-		if (offset + limit < total)
+		}
+		if (offset + limit < total) {
 			nav.push(
 				Markup.button.callback(
 					'Keyingi ➡️',
 					`P|chat|${chatId}|${offset + limit}`
 				)
 			);
+		}
 		if (nav.length) kb.push(nav);
 
-		return ctx.reply(
+		return safeReply(
+			ctx,
 			`📚 Darslar (${offset + 1}–${Math.min(
 				offset + limit,
 				total
@@ -348,11 +455,11 @@ async function showLessonsMenu(ctx, offset = 0) {
 			Markup.inlineKeyboard(kb)
 		);
 	} else {
-		// Private: foydalanuvchi bor guruhlardagi darslar
 		const userId = String(ctx.from.id);
 		const total = countUserVideos.get(userId).c;
 		if (total === 0) {
-			return ctx.reply(
+			return safeReply(
+				ctx,
 				'Siz bo‘lgan guruhlarda indekslangan darslar topilmadi.'
 			);
 		}
@@ -366,23 +473,26 @@ async function showLessonsMenu(ctx, offset = 0) {
 		]);
 
 		const nav = [];
-		if (offset > 0)
+		if (offset > 0) {
 			nav.push(
 				Markup.button.callback(
 					'⬅️ Oldingi',
 					`P|user|${userId}|${Math.max(0, offset - limit)}`
 				)
 			);
-		if (offset + limit < total)
+		}
+		if (offset + limit < total) {
 			nav.push(
 				Markup.button.callback(
 					'Keyingi ➡️',
 					`P|user|${userId}|${offset + limit}`
 				)
 			);
+		}
 		if (nav.length) kb.push(nav);
 
-		return ctx.reply(
+		return safeReply(
+			ctx,
 			`📚 Darslar (${offset + 1}–${Math.min(
 				offset + limit,
 				total
@@ -392,52 +502,54 @@ async function showLessonsMenu(ctx, offset = 0) {
 	}
 }
 
-// Callback handlerlar:
-//  - L|<chatId>|<messageId>  → shu xabarni forward qiladi
-//  - P|chat|<chatId>|<offset> → guruh sahifalash
-//  - P|user|<userId>|<offset> → private sahifalash
+// 4) Callback handler with debounce
+const handledCallbacks = new Set();
+setInterval(() => handledCallbacks.clear(), 30000); // clean every 30s
+
 bot.on('callback_query', async ctx => {
 	try {
+		const id = ctx.callbackQuery.id;
+		if (handledCallbacks.has(id)) {
+			return safeAnswerCb(ctx, '⏳', { cache_time: 2 }).catch(() => {});
+		}
+		handledCallbacks.add(id);
+
 		const data = ctx.callbackQuery.data || '';
 		if (data.startsWith('L|')) {
 			const [, chatId, messageId] = data.split('|');
 			const isPrivate = ctx.chat?.type === 'private';
 			const targetId = isPrivate ? String(ctx.from.id) : String(ctx.chat.id);
 
-			await ctx.telegram
-				.forwardMessage(targetId, chatId, Number(messageId))
-				.catch(() =>
-					ctx.answerCbQuery(
-						'Forward qilib bo‘lmadi (xabar o‘chirilgan bo‘lishi mumkin).',
-						{ show_alert: true }
-					)
-				);
-			await ctx.answerCbQuery('Yuborildi.');
+			await safeForward(ctx.telegram, targetId, chatId, messageId).catch(() =>
+				safeAnswerCb(
+					ctx,
+					'Forward qilib bo‘lmadi (xabar o‘chirilgan bo‘lishi mumkin).',
+					{ show_alert: true }
+				)
+			);
+			await safeAnswerCb(ctx, 'Yuborildi.').catch(() => {});
+			// remove keyboard to reduce duplicate taps
+			await safeEditReplyMarkup(ctx, undefined).catch(() => {});
 			return;
 		}
 
 		if (data.startsWith('P|')) {
-			const parts = data.split('|'); // P|chat|<chatId>|<offset> yoki P|user|<userId>|<offset>
+			// pagination
+			const parts = data.split('|'); // P|chat|<chatId>|<offset> or P|user|<userId>|<offset>
 			const scope = parts[1];
-			const id = parts[2];
 			const offset = Number(parts[3] || 0);
-
-			if (scope === 'chat') {
-				return showLessonsMenu(ctx, offset); // guruh kontekstida chat.id baribir mavjud
-			}
-			if (scope === 'user') {
-				// Private kontekstida ham ayni funksiya ishlaydi (showLessonsMenu ichida private yo‘li bor)
-				return showLessonsMenu(ctx, offset);
-			}
+			await safeAnswerCb(ctx, '⏭️').catch(() => {});
+			return showLessonsMenu(ctx, offset);
 		}
 	} catch (e) {
 		console.error('callback error', e);
 	}
 });
 
-// ---- /help ----
+// 5) /help
 bot.command('help', ctx => {
-	return ctx.reply(
+	return safeReply(
+		ctx,
 		`Qoidalar:
 • Video faqat guruhga tashlangan bo‘lsa indekslanadi (caption — nom sifatida).
 • Qidiruv faqat /find orqali:
@@ -451,7 +563,17 @@ bot.command('help', ctx => {
 	);
 });
 
-// ---- Start ----
+// ---------- Central error catcher ----------
+bot.catch(async (err, ctx) => {
+	console.error('Unhandled bot error:', err);
+	if (ctx?.chat?.type === 'private') {
+		try {
+			await safeReply(ctx, 'Kutilmagan texnik nosozlik. Qayta urinib ko‘ring.');
+		} catch {}
+	}
+});
+
+// ---------- Start ----------
 bot.launch().then(() => console.log('Bot is running...'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
